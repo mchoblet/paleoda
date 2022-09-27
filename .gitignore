@@ -1,0 +1,7 @@
+results/experiments/
+results/plots/
+backup
+__pycache__
+data/model_data/
+data/orographies/
+data/proxy_dbs/_

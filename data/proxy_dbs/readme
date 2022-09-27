@@ -1,0 +1,9 @@
+The proxy data in the 20th century seems to have some serious bugs. I need to have a look in all proxy timeseries once again. Probably some locations just have wrong values.
+
+To-do:
+	- quick look through all proxy timeseries
+	- discard mixed mineralogy locations
+	- discard proxies which have a large height difference, I guess these locations cause some trouble
+
+
+
