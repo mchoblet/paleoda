@@ -10,7 +10,8 @@ import evaluation
 import tqdm
 import warnings
 from numba import njit,prange
-
+import os
+import pdb
 
 def config_check(cfg):
     """
@@ -39,7 +40,8 @@ def config_check(cfg):
             if cfg['psm'][0]==None:
                 cfg['psm']=[None for i in range(len(cfg['obsdata']))]
         else:
-            raise TypeError('obsdata- and psm- configuration are not of same length')
+            pass
+            #raise TypeError('obsdata- and psm- configuration are not of same length')
 
     ##check proxy error config
     if len(cfg['proxy_error'])!=len(cfg['obsdata']):
@@ -48,7 +50,8 @@ def config_check(cfg):
             val=cfg['proxy_error'][0]
             cfg['proxy_error']=[val for i in range(len(cfg['obsdata']))]
         else:
-            raise TypeError('obsdata- and proxy_error- configuration are not of same length')
+            pass
+            #raise TypeError('obsdata- and proxy_error- configuration are not of same length')
 
     #check timescale config 
     if len(cfg['time_scales'])!=len(cfg['obsdata']):
@@ -58,7 +61,8 @@ def config_check(cfg):
             val=cfg['time_scales'][0]
             cfg['time_scales']=[val for i in range(len(cfg['obsdata']))]
         else:
-            raise TypeError('obsdata- and time_scale- configuration are not of same length')   
+            pass
+            #raise TypeError('obsdata- and time_scale- configuration are not of same length')   
     
     #in case we use pseudoproxies do addtional adjustments
 
@@ -136,7 +140,46 @@ def proxy_load(c):
     #loop over each database
     for ip,p in enumerate(c.obsdata):
         #load proxy database, slice time and extract lat and lon
-        proxy_db=xr.open_dataset(p,use_cftime=True).squeeze(drop=True)
+        proxy_db=xr.open_dataset(p,use_cftime=True)#.squeeze(drop=True)
+        
+        #eventually limit proxies geographically (its probably wiser to create a separate database for proxies of a region and study them first)
+        
+        if c.only_regional_proxies==True:
+            bounds=c.regional_bounds #[[latS,latN],[latW,latE]]
+            if bounds!=False and bounds!=None:
+                #latitudes selection
+                proxies=proxy_db
+                proxy_db=proxy_db.where((proxy_db.lat>= bounds[0][0] ) & (proxy_db.lat <= bounds[0][1]), drop=True)
+
+                lat=proxies.lat
+                lon=proxies.lon
+                lats,lons=bounds[0],bounds[1]
+                proxies=proxies.where( (proxies.lat >= lats[0] ) & (proxies.lat <= lats[1]), drop=True)
+                if lons[0]<lons[1]:    # normal selection of longitudes
+                    proxies=proxies.where( (proxies.lon >= lons[0] ) & (proxies.lon <= lons[1]), drop=True)
+                else:    #cross zero-meridian region option
+                    lon=proxies.lon
+                    sel_lon_1 = lon.where((lon >= lons[0] ), drop=True)
+                    sel_lon_2 = lon.where((lon <= lons[1]), drop=True)
+                    sel_lon=np.concatenate([sel_lon_1,sel_lon_2])
+
+                    #workaround!
+                    prox1=proxies.where((lon <= lons[1] ),drop=True)
+                    prox2=proxies.where((lon >= lons[0] ),drop=True)
+                    proxies=xr.merge([prox1,prox2])             
+        
+        #option to select only a fraction of the proxies from the beginning (meant for PPEs)
+        try:
+            if c.how_many is not None:              
+                prox_mems=c.how_many[ip] # absolute number
+                if prox_mems>len(proxy_db.site):
+                    prox_mems=len(proxy_db.site)
+            prox_idx=dataloader.random_indices(prox_mems,len(proxy_db.site), reps=1,seed=c.seed)
+
+            proxy_db=proxy_db.isel(site=prox_idx[0])                                      
+        except:
+            pass
+        
         
         proxy_db=proxy_db.sel(time=slice(time[0],time[-1]))
         
@@ -160,8 +203,7 @@ def proxy_load(c):
         for idx,s in enumerate(pp_y.site):
         
         
-            #drop locations without records, but only when working with realproxies
-            
+            #drop locations without records, but only when working with realproxies           
             if c.ppe['use']==True:
                 avail_times=pp_y.sel(site=s).time.values
             else:
@@ -376,9 +418,22 @@ def resample_proxies(c,timeres_list,times_list,pp_y_all):
     
     #loop over dictionary and bring together
     final_list=[]
-    for i,dic in dictionary.items():
+    for ii,(i,dic) in enumerate(dictionary.items()):
+
+        #hack for timescales without any value: create a dummy record that only has nans (will not be used)
+        #does not work! because of multi timescale ...
+        """
+        if len(dic['sites'])==0:
+            #get length of
+            length=len(times_list[ii])
+            vals=[np.nan*np.ones(length)]
+            sites=['0.999']
+        else:
+        """
+        
         vals=np.stack(dic['ts'])
         sites=dic['sites']
+        
         idx=int(np.argwhere(timescales==int(i)).flatten())
         target_time=times_list[idx]
         data_array=xr.DataArray(vals,coords=dict(site=sites,time=target_time))
@@ -388,7 +443,7 @@ def resample_proxies(c,timeres_list,times_list,pp_y_all):
         integers=(list(map(int,list(map(float,sites)))))
         data_array.attrs['DB_members']=np.unique(integers,return_counts=True)[1]
         final_list.append(data_array.transpose('time','site'))
-       
+        
     return final_list
 
 
@@ -449,8 +504,7 @@ def make_equidistant_target(data,target_time,target_res,method_interpol='nearest
 
     #1. resampling (upsampling) and interpolating (upsampling)
     min_ts=str(min_ts)+'YS'
-    #import pdb
-    #pdb.set_trace()
+
     try:
         upsampled=vals_new.resample(time=min_ts).interpolate(method_interpol)
     except:
@@ -642,7 +696,8 @@ def noresample_proxies(c,timeres_list,times_list,pp_y_all):
        
     return final_list
 
-def psm_apply(c,prior,prior_raw, pp_y_all):
+def psm_apply(c,prior,prior_raw, pp_y_all,other_model=False):
+    
     """
     Takes prior and config.
     Psm weighted yearly average requires monthly data (prior_raw)
@@ -662,12 +717,20 @@ def psm_apply(c,prior,prior_raw, pp_y_all):
             - weighting: precipitation, None
             - height: True/False (given by orography file)
         
-    These options are given in c.psm as a list
+        other_model: this is set to True for the noise_bf_filt option (that is only relevant for d18O)
+                     this option is only used in pseudoproxy_generator function (source external part)
+        
+    These options are given in c.psm as a dict.
     """
     #List where we append the model proxy estimates to for each database
     HXfull_all=[]
     
+    #eventually pp_r will be exchanged
+    pp_r=None
+    pp_r_list=[]
+    
     #loop over psms (which corresponds do looping over the proxy dbs, because there is one psm for each proxy db)
+
     for i,psm in enumerate(c.psm):
         #extract values
         #lats=pp_y_lat[i]
@@ -690,19 +753,32 @@ def psm_apply(c,prior,prior_raw, pp_y_all):
         elif psm=='speleo':
             #weighting
             print('USING SPELEO PSM')
-            
+                      
             if c.speleo['weighting']=='inf':
                 print('>>>>>>>>>>>>>GETTING MONTHLY d18O Data')
                 d18=psm_pseudoproxy.infilt_weighting(prior_raw['d18O'],prior_raw['prec'],prior_raw['evap'],slice_unfinished=True,check_nan=c.check_nan)
+           
+            
             elif c.speleo['weighting']=='prec':
                 print('>>>>>>>>>>>>>GETTING MONTHLY d18O Data')
                 d18=psm_pseudoproxy.prec_weighting(prior_raw['d18O'],prior_raw['prec'],slice_unfinished=True,check_nan=c.check_nan)
             else:
                 d18=prior['d18O']
+                        
+            #pdb conversion at the beginning, always!
+            d18=psm_pseudoproxy.pdb_conversion(d18)    
             
             d18=psm_pseudoproxy.obs_from_model(d18,lat=lats,lon=lons,interpol=c.interpol)
             #replace site names, else missing
             d18['site']=proxies['site']
+            
+            #add noise! (other model option prevent that this is applied to HXf)
+            if c.ppe['use']==True:
+                    if c.ppe['noise_bf_filt']==True and other_model==True:
+
+                        print('Noise added to d18O before filtering')
+                        d18,pp_r=psm_pseudoproxy.pseudoproxies(d18, SNR=c.ppe['SNR'][0],noisetype=c.ppe['noise_type'],seed=c.seed)
+            
             
             tsurf=prior['tsurf']
             tsurf=psm_pseudoproxy.obs_from_model(tsurf,lat=lats,lon=lons,interpol=c.interpol)
@@ -714,50 +790,33 @@ def psm_apply(c,prior,prior_raw, pp_y_all):
                 oro=xr.open_dataset(c.oro)['oro']
                 #my obs_from model function is a sel that works with single lats and lons
                 #obs from model interpolation seems to be important for some speleos in order to not completly
-                #be off (especially Echam and CESM Model)
+                #be off (especially Echam and CESM Model)  
                 oro=psm_pseudoproxy.obs_from_model(oro,lat=lats,lon=lons,interpol='dw')
                 
                 elev=proxies['elev']
                 z=(elev-oro)
-            
                 #Tsurf: -0.65 https://en.wikipedia.org/wiki/Lapse_rate
                 #d18O take global value: global average -0.28: https://www.ajsonline.org/content/ajs/301/1/1.full.pdf
                 
                 #most height sensitive speleos are in the himalay, where the lapse rate is smaller
-                d18= d18 + -0.15/100*z
-                tsurf = tsurf + -0.65/100*z
-
-            #fractionation (separated treatment of aragonite and calcite)   
-            if c.speleo['fractionation']==True:
-                print('>>>>>>>>>>>>>APPLYING FRACTIONATION')
-                #distinguish between aragonite/non-aragonite sites, assume non-aragonite is calcite
-                
-                arag_sites=proxies.where(proxies['mineralogy']=='aragonite',drop=True).site
-                calc_sites=proxies.where(proxies['mineralogy']!='aragonite',drop=True).site
-                
-                #applying the mean tsurf, not tsurf itself, as else the covariance pattern is seriously reduced!
-                
-                if c.speleo['fractionation_temp']=='mean':
-                    print('use mean temperature')
-                    d18_calc=psm_pseudoproxy.frac(d18.sel(site=calc_sites),tsurf.sel(site=calc_sites).mean('time'),psm_pseudoproxy.pdb_coplen,psm_pseudoproxy.alpha_calc_trem)
-                    d18_arag=psm_pseudoproxy.frac(d18.sel(site=arag_sites),tsurf.sel(site=arag_sites).mean('time'),psm_pseudoproxy.pdb_coplen,psm_pseudoproxy.alpha_arag_grossman)
-                
-                elif c.speleo['fractionation_temp']=='regular':
-                    print('use time-varying temperature')
-                    d18_calc=psm_pseudoproxy.frac(d18.sel(site=calc_sites),tsurf.sel(site=calc_sites),psm_pseudoproxy.pdb_coplen,psm_pseudoproxy.alpha_calc_trem)
-                    d18_arag=psm_pseudoproxy.frac(d18.sel(site=arag_sites),tsurf.sel(site=arag_sites),psm_pseudoproxy.pdb_coplen,psm_pseudoproxy.alpha_arag_grossman)
-                else:
-                    print('unknown fractionation_temp-mode')
-                    break    
-                
-                d18.loc[dict(site=calc_sites)]=d18_calc
-                d18.loc[dict(site=arag_sites)]=d18_arag
+                d18= d18 + -0.28/100*z
+                tsurf = tsurf + -0.5/100*z
             
+                                    
             #karst filter
             if c.speleo['filter']==True:
                 print('>>>>>>>>>>>>>APPLYING KARST FILTER')
                 #following the PRYSM PSM by S. Dee (2015). Transit time 2.5 as in Bühler 2021
                 #for individual transit time it would be easiest to adapt the proxy_db DataSet with some additional coordinate as metadata
+                
+                #add noise before the filtering process for pseudoproxies, applied to d18O and temp 
+                # WARNING: only works with a uniform SNR for all databases, and does not make sense for multi-timescale!
+                
+                #hacky solution to make experiments for seeing how much information is lost due to filtering
+                #the noise is recalculated afterwards to not make output of this function too clumsy (can be done when c.seed is set)
+                
+                        #noise not added to tsurf (but could be changed)
+                        #tsurf,_=psm_pseudoproxy.pseudoproxies(temp, SNR=c.ppe['SNR'][0],noisetype=c.ppe['noise_type'],seed=c.seed)
                 
                 tau0=c.speleo['t_time']
                 #set timeseries
@@ -783,18 +842,68 @@ def psm_apply(c,prior,prior_raw, pp_y_all):
                     #exchange values in initial array
 
                     d18.loc[dict(site=s)]=conv+mean
-
+            
+                        #fractionation (separated treatment of aragonite and calcite)   
+                        
+            if c.speleo['fractionation']==True:
+                print('>>>>>>>>>>>>>APPLYING FRACTIONATION')
+                #distinguish between aragonite/non-aragonite sites, assume non-aragonite is calcite
+                
+                arag_sites=proxies.where(proxies['mineralogy']=='aragonite',drop=True).site
+                calc_sites=proxies.where(proxies['mineralogy']!='aragonite',drop=True).site
+                
+                #applying the mean tsurf, not tsurf itself, as else the covariance pattern is seriously reduced!
+                
+                if c.speleo['fractionation_temp']=='mean':
+                    print('use mean temperature')
+                    #d18_calc=psm_pseudoproxy.frac(d18.sel(site=calc_sites),tsurf.sel(site=calc_sites).mean('time'),psm_pseudoproxy.pdb_coplen,psm_pseudoproxy.alpha_calc_trem)
+                    #d18_arag=psm_pseudoproxy.frac(d18.sel(site=arag_sites),tsurf.sel(site=arag_sites).mean('time'),psm_pseudoproxy.pdb_coplen,psm_pseudoproxy.alpha_arag_grossman)
+                    d18_calc=psm_pseudoproxy.frac(d18.sel(site=calc_sites),tsurf.sel(site=calc_sites).mean('time'),psm_pseudoproxy.alpha_calc_trem)
+                    d18_arag=psm_pseudoproxy.frac(d18.sel(site=arag_sites),tsurf.sel(site=arag_sites).mean('time'),psm_pseudoproxy.alpha_arag_grossman)
+                
+                
+                elif c.speleo['fractionation_temp']=='regular':
+                    print('use time-varying temperature')
+                    #d18_calc=psm_pseudoproxy.frac(d18.sel(site=calc_sites),tsurf.sel(site=calc_sites),psm_pseudoproxy.pdb_coplen,psm_pseudoproxy.alpha_calc_trem)
+                    #d18_arag=psm_pseudoproxy.frac(d18.sel(site=arag_sites),tsurf.sel(site=arag_sites),psm_pseudoproxy.pdb_coplen,psm_pseudoproxy.alpha_arag_grossman)
+                    d18_calc=psm_pseudoproxy.frac(d18.sel(site=calc_sites),tsurf.sel(site=calc_sites),psm_pseudoproxy.alpha_calc_trem)
+                    d18_arag=psm_pseudoproxy.frac(d18.sel(site=arag_sites),tsurf.sel(site=arag_sites),psm_pseudoproxy.alpha_arag_grossman)
+                    
+                else:
+                    print('unknown fractionation_temp-mode')
+                    break    
+                
+                d18.loc[dict(site=calc_sites)]=d18_calc
+                d18.loc[dict(site=arag_sites)]=d18_arag
+             
+            #if no fractionation deconvert pdb!  (Else the value is really off)
+            else:
+                d18=psm_pseudoproxy.pdb_conversion_r(d18) 
+                
             HXfull=d18
+            
+            if pp_r is not None:
+                pp_r_list.append(pp_r)
+            
+            
             
         elif psm=='icecore':
             print('USING ICECORE PSM')
             #weighting
             if c.icecore['weighting']=='prec':
-                d18=psm_pseudoproxy.prec_weighting(prior_raw['d18O'],prior_raw['prec'],slice_unfinished=True)
+                print('>>>>>>>>>>>>>APPLYING PREC WEIGHTING')
+                d18=psm_pseudoproxy.prec_weighting(prior_raw['d18O'],prior_raw['prec'],slice_unfinished=True,check_nan=c.check_nan)
             else:
                 d18=prior['d18O']
             
+
+            
             d18=psm_pseudoproxy.obs_from_model(d18,lat=lats,lon=lons,interpol=c.interpol)
+                        #add noise! (other model option prevent that this is applied to HXf)
+            if c.ppe['use']==True:
+                    if c.ppe['noise_bf_filt']==True and other_model==True:
+                        print('Noise added to d18O before filtering')
+                        d18,pp_r=psm_pseudoproxy.pseudoproxies(d18, SNR=c.ppe['SNR'][0],noisetype=c.ppe['noise_type'],seed=c.seed)
             
             #height correction
             if c.icecore['height']==True:
@@ -805,11 +914,12 @@ def psm_apply(c,prior,prior_raw, pp_y_all):
                 elev=proxies['elev']
                 
                 z=(elev-oro)
-            
                 #Tsurf: -0.65 https://en.wikipedia.org/wiki/Lapse_rate
                 #d18O take global value: global average -0.28: https://www.ajsonline.org/content/ajs/301/1/1.full.pdf
-                d18= d18 + proxies['lapse_rate']/100*z
+                #d18= d18 + proxies['lapse_rate']/100*z            
+                d18= d18 + -0.28/100*z            
             
+                        
             #Diffusion and compactation
             if c.icecore['filter']==True:
                 print('>>>>>>>>>>>>>APPLYING PRYSM ICECORE FILTER')
@@ -818,15 +928,16 @@ def psm_apply(c,prior,prior_raw, pp_y_all):
                 prec_site['site']=d18.site
                 tsurf_site=psm_pseudoproxy.obs_from_model(prior['tsurf'],lat=lats,lon=lons,interpol=c.interpol)                
                 tsurf_site['site']=d18.site
+                 
+                #add noise before the filtering process for pseudoproxies, only acts on the d18O (see above)
                 
                 for s in tqdm.tqdm(d18.site):
                     #only nproc=1 workso
                     d18.loc[dict(site=s)]=psm_pseudoproxy.ice_archive(d18.sel(site=s),prec_site.sel(site=s),tsurf_site.sel(site=s),xr.DataArray(np.array([101.325]*len(prior.time))),nproc=1)
 
             HXfull=d18
-            
-            
-   
+            if pp_r is not None:
+                pp_r_list.append(pp_r)
             
         else:
             raise Exception("Given psm type unknown. check 'psm' in config dictionary.")
@@ -835,7 +946,12 @@ def psm_apply(c,prior,prior_raw, pp_y_all):
         HXfull['site']=proxies['site']
         HXfull_all.append(HXfull)
     
-    return HXfull_all
+    #pseudoproxy error is eventually returned (else its just none and nothing happens)
+    
+    if other_model==True:
+        return HXfull_all,pp_r_list
+    else:
+        return HXfull_all
  
 def resample_wrapper(c,pp_y_all,pp_r_all):    
     #Suppres warnings. Bad practice, but warnings in resampling part are annoying (some pandas stuff)
@@ -844,13 +960,20 @@ def resample_wrapper(c,pp_y_all,pp_r_all):
 
     #time arrays for each resolution
     length=int(c.proxy_time[1])-int(c.proxy_time[0])
-    times_list=[xr.DataArray(xr.cftime_range(start=c.proxy_time[0],periods=(length//i+1),freq=str(i)+'YS',calendar='365_day'),dims='time') for i in c.timescales]
+    
+    #workaround if we want to reconstruct only x-year means (speleo experiments)
+    if 1 not in c.timescales:
+        times_list=[xr.DataArray(xr.cftime_range(start=c.proxy_time[0],periods=(length//i+1),freq=str(i)+'YS',calendar='365_day'),dims='time') for i in np.concatenate([[1],c.timescales])]
+    else:
+        times_list=[xr.DataArray(xr.cftime_range(start=c.proxy_time[0],periods=(length//i+1),freq=str(i)+'YS',calendar='365_day'),dims='time') for i in c.timescales]
 
     #adapt times_list (cut end in case it doesn't fit perfectly with largest block size)
     #I needed an (eventually) different times_list for resampling the proxies
     #this could definitely be nicer
     new_times_list=[]
     time_sc=c.timescales
+    if 1 not in time_sc:
+        time_sc=np.insert(time_sc,0,1)
     for i,t in enumerate(times_list):
         ts=time_sc[i]
         end=str(((int(c.time[1])-int(c.time[0]))//ts)*ts+int(c.time[0]))
@@ -897,7 +1020,7 @@ def resample_wrapper(c,pp_y_all,pp_r_all):
             lisst=resample_proxies(c,timeres_list,times_list,pp_y_all)
 
         #case where we don't want the fancy resampling technique, just assigning the values as they are (eventually means if more than one value for each subblock)
-        elif len(c.timescales) > 1:
+        elif len(c.timescales) > 1 or 1 not in c.timescales:
             lisst=noresample_proxies(c,timeres_list,times_list,pp_y_all)
 
         #just assign each proxy to annual and keep the timeseries as they are. Proxies are going to be used as they are available in the original table
@@ -934,15 +1057,24 @@ def resample_wrapper(c,pp_y_all,pp_r_all):
                     med=np.nanmedian(pp_r_all[int(float(s))].sel(site=s))
                     pp_r.loc[dict(site=s,time=avail_times)]=np.ones(len(avail_times))*med
             lisst_r.append(pp_r)
-    
+        
+        #hack for creating dummy timescale 1 arrays (assuming we want to reconstruct only 10 year means)
+        if 1 not in c.timescales:
+            da = xr.DataArray(np.nan, coords=dict(time=times_list[0], site=['-1']), dims=("time", "site"))
+            da.attrs['DB_members']=[-1]
+            lisst.insert(0,da)
+            lisst_r.insert(0,da)
+            
     else:
         lisst=None
         lisst_r=None
+    
     
     return pp_y_all,pp_r_all,times_list,lisst,lisst_r
  
    
 def pseudoproxy_generator(cfg,HXfull_all,pp_y_all,times_list):
+
     """
     Wrapper for generating pseudoproxies at the locations given by the proxy-dbs.
     Generates proxies from the modeled proxy estimates (HXfull_all) with a specific SNR value.
@@ -967,6 +1099,7 @@ def pseudoproxy_generator(cfg,HXfull_all,pp_y_all,times_list):
 
     #exchange times_list
     length=int(c.proxy_time[1])-int(c.proxy_time[0])
+    
     times_list=[xr.DataArray(xr.cftime_range(start=c.proxy_time[0],periods=(length//i++1),freq=str(i)+'YS',calendar='365_day'),dims='time') for i in timescales]
 
     dictionary={}
@@ -986,7 +1119,6 @@ def pseudoproxy_generator(cfg,HXfull_all,pp_y_all,times_list):
                 step=str(time_s)+'YS'
                 #resample HXfull
                 HXfull_res=HXfull.resample(time=step,closed='left').mean('time')
-                
                 pp_y,pp_r=psm_pseudoproxy.pseudoproxies(HXfull_res,SNR=c.ppe['SNR'][i],noisetype=c.ppe['noise_type'],seed=c.seed)
             
                 #cut pseudoproxies in time
@@ -1023,10 +1155,14 @@ def pseudoproxy_generator(cfg,HXfull_all,pp_y_all,times_list):
 
         c2=SimpleNamespace(**cfg_2)
         
-        prior_ext, attributes_ext, prior_monthly_ext=prior_preparation(c2)
+        prior_ext, attributes_ext, prior_monthly_ext=prior_preparation(c2)        
         
+        #cut prior in time
+        prior_ext=prior_ext.sel(time=slice(c.proxy_time[0],c.proxy_time[1]))
+        prior_monthly_ext=prior_monthly_ext.sel(time=slice(c.proxy_time[0],c.proxy_time[1]))
+
         
-        HXfull_all_ext=psm_apply(c2,prior_ext,prior_monthly_ext, pp_y_all)
+        HXfull_all_ext,pp_r_list=psm_apply(c2,prior_ext,prior_monthly_ext, pp_y_all,other_model=True)
         
         for i,HXfull in enumerate(HXfull_all_ext):
             
@@ -1038,18 +1174,28 @@ def pseudoproxy_generator(cfg,HXfull_all,pp_y_all,times_list):
                 #resample HXfull
                 HXfull_res=HXfull.resample(time=step,closed='left').mean('time')
                 
-                pp_y,pp_r=psm_pseudoproxy.pseudoproxies(HXfull_res,SNR=c.ppe['SNR'][i],noisetype=c.ppe['noise_type'],seed=c.seed)
+                #if noise has already been applied! (This could be tidied
+                if c.ppe['noise_bf_filt']==True:
+                    pp_y=HXfull_res
+                    pp_r=pp_r_list[i]
+                else:
+                    pp_y,pp_r=psm_pseudoproxy.pseudoproxies(HXfull_res,SNR=c.ppe['SNR'][i],noisetype=c.ppe['noise_type'],seed=c.seed)
+
+                
+                #pp_y,pp_r=psm_pseudoproxy.pseudoproxies(HXfull_res,SNR=c.ppe['SNR'][i],noisetype=c.ppe['noise_type'],seed=c.seed)
             
-                #cut pseudoproxies in time
-                pp_y=pp_y.sel(time=slice(c.proxy_time[0],c.proxy_time[1]))
-                pp_r=pp_r.sel(time=slice(c.proxy_time[0],c.proxy_time[1]))
+                #cut pseudoproxies in time (applied directly to prior)
+                #pp_y=pp_y.sel(time=slice(c.proxy_time[0],c.proxy_time[1]))
+                #pp_r=pp_r.sel(time=slice(c.proxy_time[0],c.proxy_time[1]))
                 
                 #append!
                 dictionary[str(time_s)]['ts'].append(pp_y.values)#p.resample(time=step,closed='left').mean('time')
                 dictionary[str(time_s)]['sites'].append(pp_y['site'].values)
-                #also error
+                #also error      
                 dictionary[str(time_s)]['r'].append(pp_r.values)#seudo_r_all[i].resample(time=step,closed='left').mean('time')        
-        
+                
+                #pdb.set_trace()
+                
         
         """
         #ADAPTATION OF TIMES_LIST # NEEDS FIXING. THE IDEA IS NICE, BUT I HAVE TO THINK ABOUT HOW TO EXACTLY HANDLE IT.
@@ -1089,6 +1235,9 @@ def pseudoproxy_generator(cfg,HXfull_all,pp_y_all,times_list):
     else: raise Exception("Pseudoproxy source unknown, check c['ppe']['source'].")
            
     #loop over dictionary and bring together into list of lists
+    
+
+    
     final_list=[]
     error_list=[]
     for i,dic in dictionary.items():
@@ -1111,31 +1260,40 @@ def pseudoproxy_generator(cfg,HXfull_all,pp_y_all,times_list):
         #add errors
         vals=np.concatenate(dic['r'],axis=-1)
         
-        #import pdb
-        #pdb.set_trace()
-        
+
         data_array=xr.DataArray(vals,dims=('time','site'),coords=dict(time=target_time.values,site=sites))
         #We add an attribute to each time-series to have the number of proxies per database directly accesible
         data_array.attrs['DB_members']=np.unique(integers,return_counts=True)[1]
         error_list.append(data_array.transpose('time','site'))         
-             
+
     return prior_ext, HXfull_all_ext,final_list,error_list,times_list
 
 def anomaly_proxies(c,pp_y_all):
     """
     Anomalies only computed on the proxies (list form due to multiple timescales)
     Separation into two functions useful since wrapper also include multi-model-prior option.
+    workaround for empty slice (if reconstructing only on longer than annual)
+    
     """
     def proxies_anomaly(proxy_list,start=None,end=None):
         pp_y_list=[]
         if start is not None:
-            for pp in pp_y_all_a:
-                m_p=pp.sel(time=slice(start,end)).mean('time',skipna=True)
-                pp_y_list.append(pp-m_p)
+            for pp in proxy_list:
+                try:
+                    m_p=pp-pp.sel(time=slice(start,end)).mean('time',skipna=True)
+                except:
+                    m_p=pp
+                #add back the DB_members attribute (important!=
+                m_p.attrs['DB_members']=pp.attrs['DB_members']
+                pp_y_list.append(m_p)
         else:
             for pp in pp_y_all_a:
-                m_p=pp.mean('time',skipna=True)
-                pp_y_list.append(pp-m_p)
+                try:
+                    m_p=pp-pp.mean('time',skipna=True)
+                except:
+                    m_p=pp
+                m_p.attrs['DB_members']=pp.attrs['DB_members']
+                pp_y_list.append(m_p)
         return pp_y_list
     
     pp_y_all_a=pp_y_all.copy()    
@@ -1264,8 +1422,6 @@ def extra_assimil(c,prior,prior_raw,HXfull_all_fin):
         names_short.append(('pr_w_d18'))
     
     if len(lengths)>0:
-        #import pdb
-        #pdb.set_trace()
         
         extra_list=np.concatenate(extra_list,axis=-1)
         names=np.concatenate(names)
@@ -1383,8 +1539,9 @@ def mean_plus_anoms(mean,anom):
     Output:
         (bs,nens,values)
     On Gryffindor the time-advantage might not be so large as on Ravenclaw (there 2-5).
+    Without this it would just be: mean + anom (broadcasting is automatic)
     
-    Without this it would just be: mean + anom (broadcasting is automatico
+    21.10.22: Weird bug: This does not work with covariance localization for some reason.
     
     """
     #copy anom shape, no deepcopy as this is slow
@@ -1396,6 +1553,9 @@ def mean_plus_anoms(mean,anom):
             for k in prange(nvals):
                 new_ensemble[i,j,k]=mean[j,k]+anom[i,j,k]
     return new_ensemble
+    
+def mean_plus_anoms_nonumba(mean,anom):
+    return mean + anom
 
 def globalmean(field,name=''):
     """
@@ -1421,7 +1581,10 @@ def globalmean(field,name=''):
     lat=field.lat
     wgt=np.cos(np.deg2rad(lat))
     field_m=field.weighted(wgt).mean(('lat','lon'))
-    field_m=field_m.rename(('gm_'+name))
+    try:
+        field_m=field_m.rename(('gm_'+name))
+    except:
+        pass
     return field_m
 
 def lat_mean(field,name):
@@ -1434,7 +1597,7 @@ def lat_mean(field,name):
     return field_m
 
 
-def regionalmean(field,lats,lons,name):
+def regionalmean(field,lats,lons,name=None):
     """
     Function that calculates the regional mean of a climate field. (Eg nino index if you have SST data).
     Does latitudinal weight averageing. Also computes correct average for cross zero meridan regions (e.g 350,10)
@@ -1463,10 +1626,11 @@ def regionalmean(field,lats,lons,name):
     
     wgt=np.cos(np.deg2rad(lat))
     field_m=field.sel(lat=sel_lat,lon=sel_lon).weighted(wgt).mean(('lat','lon'))
-    field_m=field_m.rename(('regm_'+name))
+    if name!=None:
+        field_m=field_m.rename(('regm_'+name))
     return field_m
 
-def evaluation_saving(c, num_vars, names_short_vector, splitted_mean, splitted_std, times_list, coordinates, truth, prior, lisst, HXfull_all_fin, rank_dic, rank_dic_post, MC_idx_list, sites, prior_block,  attributes, pp_y_all,pp_r_all,split_vector,time_res,cfg):
+def evaluation_saving(c, num_vars, names_short_vector, splitted_mean, splitted_std, times_list, coordinates, truth, prior, lisst, HXfull_all_fin, rank_dic, rank_dic_post, MC_idx_list, sites, prior_block,  attributes, pp_y_all,pp_r_all,split_vector,time_res,cfg,base_path):
     """
     Function where all the evaluations and saving procedures are done. Outsourced to this function to make the wrapper less cluttered.
     """
@@ -1510,13 +1674,14 @@ def evaluation_saving(c, num_vars, names_short_vector, splitted_mean, splitted_s
                 elif metric=='RE':
                     #requires uninformed prior (truth)
                     uninformed_prior=prior[name] #will compute mean over this prior
-                    result=evaluation.RE(truth,save_mean,uninformed_prior)
+                    result=evaluation.RE(truth[name],save_mean,uninformed_prior)
                     ds[(name+'_'+str(metric))]=(('lat','lon'),result.values)
         ds_list.append(ds)
     
     #non pseudoproxy_metrics
     for metric in c.metrics:        
         if metric=='CD':
+            print('Compute correlation distance for each timescale')
             #COMPUTE CORRELATION OF MODELED PROXY ENSEMBLE (of proxy var) TO BACKGROUND CLIMATE FIELD (full)
             #this is more or less the correlation that is used for reconstructing (but not exactly, as for each timestep the proxy availabiltiy varies)
             #+ we have a different prior. Keep this in mind when interpreting this.
@@ -1542,7 +1707,7 @@ def evaluation_saving(c, num_vars, names_short_vector, splitted_mean, splitted_s
                     proxy_estimates,_= anomean_with_numba(proxy_estimates.values,tres)
                     #convert proxy_estimates to DataArray, as this is needed by CD-function
                     proxy_estimates=xr.DataArray(proxy_estimates,dims=('time','site'))
-
+                                 
                     #get amount of proxies per db to split it
                     split_idx=np.cumsum(lisst[i_tres].attrs['DB_members'])[:-1]
                     splitted=np.split(proxy_estimates,split_idx,axis=-1)
@@ -1559,7 +1724,7 @@ def evaluation_saving(c, num_vars, names_short_vector, splitted_mean, splitted_s
                         name_str=name+'_DB_'+str(i_db)+'_'+str(tres)
                         corr_ds[(name_str+'_m')]=(('dists'),cor_mean)
                         corr_ds[(name_str+'_s')]=(('dists'),cor_std)
-
+            
             #fill distances only once, always the same
             corr_ds=corr_ds.assign_coords(dists=dist)
 
@@ -1574,19 +1739,34 @@ def evaluation_saving(c, num_vars, names_short_vector, splitted_mean, splitted_s
 
         #for rank histogram compute sum over all rank histograms (doesn't matter if sum or mean)
         elif metric=='rank_histogram':
+            ds=xr.DataArray()
             #loop over time_res
             for tres in time_res:
                 ranks=np.sum(rank_dic[str(tres)],axis=0)
+                try:
+                    ds=ds.expand_dims(ranks=ranks)
+                except:
+                    pass
                 string='rank_histogram_'+str(tres)
                 ds[string]=(('ranks'),ranks)
+            ds=ds.rename('rank_histo')
+            ds_list.append(ds)
 
         elif metric=='rank_histogram_posterior':
+            ds=xr.DataArray()
             #loop over time_res
             for tres in time_res:
                 ranks=np.sum(rank_dic_post[str(tres)],axis=0)
+                try:
+                    ds=ds.expand_dims(ranks=ranks)
+                except:
+                    pass
                 string='rank_histogram_post'+str(tres)
                 ds[string]=(('ranks'),ranks)
-
+            ds=ds.rename('rank_histo_post')    
+            ds_list.append(ds)
+        
+        
     ds=xr.merge(ds_list)        
     #ds=ds.assign_coords(MC_idx=(('reps','nens'),MC_idx))    
     ds=ds.assign_coords(MC_idx=(('model','reps','nens'),MC_idx_list))    
@@ -1595,10 +1775,14 @@ def evaluation_saving(c, num_vars, names_short_vector, splitted_mean, splitted_s
     ds['site']=sites
 
     proxies=np.concatenate(splitted_mean[num_vars:(num_vars+len(c.obsdata))],axis=-1)
-    proxies_std=np.concatenate(splitted_mean[num_vars:(num_vars+len(c.obsdata))],axis=-1)
 
+    
+    proxies_std=np.std(np.concatenate(splitted_mean[num_vars:(num_vars+len(c.obsdata))],axis=-1),axis=0)
+    
+
+    
     ds['HXf_m']=(('time','site'),proxies)
-    ds['HXf_std']=(('time','site'),proxies_std)
+    ds['HXf_std']=(('site'),proxies_std)
 
     #also save the prior estimate
     if num_vars>0:
@@ -1672,30 +1856,30 @@ def evaluation_saving(c, num_vars, names_short_vector, splitted_mean, splitted_s
     #Add the original proxy values and their locations
     #first bring them together from pp_y_all
                               
-    #not needed when working with pseudoproxies (already saved in the block above)
-    if c.ppe['use']==False:
-        pp_y_a=[]
-        pp_y_lat=[]
-        pp_y_lon=[]
-        for pp_y in pp_y_all:
-            pp_y_a.append(pp_y.values)
-            pp_y_lat.append(pp_y.lat.values)
-            pp_y_lon.append(pp_y.lon.values)
+    #also save when working with pseudoproxies, such that i also have r
+    #if c.ppe['use']==False:
+    pp_y_a=[]
+    pp_y_lat=[]
+    pp_y_lon=[]
+    for pp_y in pp_y_all:
+        pp_y_a.append(pp_y.values)
+        pp_y_lat.append(pp_y.lat.values)
+        pp_y_lon.append(pp_y.lon.values)
 
-        pp_r_a=[]
-        for pp_r in pp_r_all:
-            pp_r_a.append(pp_r.values)    
+    pp_r_a=[]
+    for pp_r in pp_r_all:
+        pp_r_a.append(pp_r.values)    
 
-        pp_r_a=np.concatenate(pp_r_a,axis=-1)
-        pp_y_a=np.concatenate(pp_y_a,axis=-1)
-        pp_y_lat=np.concatenate(pp_y_lat,axis=-1)
-        pp_y_lon=np.concatenate(pp_y_lon,axis=-1)
+    pp_r_a=np.concatenate(pp_r_a,axis=-1)
+    pp_y_a=np.concatenate(pp_y_a,axis=-1)
+    pp_y_lat=np.concatenate(pp_y_lat,axis=-1)
+    pp_y_lon=np.concatenate(pp_y_lon,axis=-1)
 
-        ds['proxies']=(('time','site'),pp_y_a)
-        ds['proxies_r']=(('time','site'),pp_r_a)
+    ds['proxies']=(('time','site'),pp_y_a)
+    ds['proxies_r']=(('time','site'),pp_r_a)
 
-        ds['proxies_lat']=(('site'),pp_y_lat)
-        ds['proxies_lon']=(('site'),pp_y_lon)
+    ds['proxies_lat']=(('site'),pp_y_lat)
+    ds['proxies_lon']=(('site'),pp_y_lon)
 
     #add back attributes
     ds.attrs['prior']=str(attributes)

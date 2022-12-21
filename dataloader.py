@@ -109,6 +109,8 @@ def annual_mean(xarray,avg=None,check_nan=False):
           are in ascending order (11,12,1 is allowed).
     - check_nan:
         - removes nan-years. This is relevant for a model like iHadCM3 where there is missing data in between. I kept these years in the prior, because else the annual mean calculation as performed here doesn't work anymore.
+        - Update 04.10.22: Do not remove, but copy the previous year. Workaround to not mess up Pseudoproxy calculation (prelimary workaround, year 1426,1427,1428 become equal to year 1425)
+        
     Output:
     - Reduced Xarray, years that are not full are cut out
     """
@@ -265,14 +267,17 @@ def annual_mean(xarray,avg=None,check_nan=False):
     xarray=xarray.rename(name)
     
     #drop years where a nan is included (this would break the code). This takes some time therefore only an option.
+    #update: copy previous year
     if check_nan:
         print('Checking prior for nans')
-        for t in xarray.time:
+        for i,t in enumerate(xarray.time):
             x=xarray.sel(time=t)
             nans=np.count_nonzero(np.isnan(x))
             if nans>0:
-                print('Dropped year', t.values, 'due to nans')
-                xarray=xarray.where(xarray.time!=t, drop=True)
+                #print('Dropped year', t.values, 'due to nans')
+                #xarray=xarray.where(xarray.time!=t, drop=True)
+                print('Only nans in year', t.values, '. Replaced values with previous year')
+                xarray.loc[dict(time=t)]=xarray.isel(time=(i-1))
    
     return xarray
 

@@ -150,10 +150,14 @@ def CD(fullfield,pp_y,pp_y_lat,pp_y_lon,nbins=100):
     #take locations from prior (stacked before kalman filter with z=('lat','lon'))
     coords=[list(z) for z in fullfield.z.values]
     
-    cores=os.cpu_count()
+    #cores=os.cpu_count()
     #Prooved to be the fastest, vectorizing this is actually slower (also mentioned here https://github.com/mapado/haversine)
-    dist=Parallel(n_jobs=cores)(delayed (haversine_vector)(l,coords, Unit.KILOMETERS,comb=True) for l in loc)
+    #dist=Parallel(n_jobs=cores)(delayed (haversine_vector)(l,coords, Unit.KILOMETERS,comb=True) for l in loc)
+    #safer:
+    dist=haversine_vector(loc,coords, Unit.KILOMETERS,comb=True)
+    
     dist=np.array(dist).T.reshape(-1)
+    
     
     #1.5 flatten arrays to 1-D vectors
     dist=np.squeeze(dist).reshape(-1)
@@ -164,6 +168,9 @@ def CD(fullfield,pp_y,pp_y_lat,pp_y_lon,nbins=100):
     
     #2. compute correlations (~10 seconds, chunked with dask else memory killed)
     data=fullfield.chunk({'z':250})
+    
+    #import pdb
+    #pdb.set_trace()
     
     corr=xr.corr(data,pp_y,dim='time')
     #corr=xr.cov(data,pp_y,dim='time')

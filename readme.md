@@ -24,12 +24,21 @@ The code has the advantages of being
 
 There are some already existing PaleoDA codes online, I share some personal comments on them and their usability the last sections.
 
-## Requirements for PaleoDA experiments
-
+## Requirements
 - Python environment specifications provided here:
 - It's easiest if you create a new environement and try to reproduce mine there. You can try to loosen package version constraints if it doesn't work. Most package versions are as of 2022.
 
 - This code can be run on a medium sized computer with a fair amount of Ram (>16gb). The prior (collection of climate states) is the major ram consuming part. Depending on the number of Monte-Carlo repetions you wish to perform (each time using a different prior/proxies) one experiment for 1000 years can run for a few hours.
+
+## Run Experiments
+
+- In the notebooks_da-folder you can find the notebooks config_explanation.ipynb and experiments.ipynb
+
+## Scientific background of the method
+
+- I will upload the methods chapter of my thesis here at some. There you will be able to follow the steps starting from the classic Kalman Filter towards Paleoclimate Data Assimilation.
+
+
 
 ## Structure of the Code
 
@@ -114,7 +123,7 @@ Covariance localisation is a technique used in Data Assimilation when ensemble s
 The first publicly available PaleoDA was the code for the Last Millenium Reanalysis (LMR), other packages, also mine have mainly followed their structure (lmr-lite-wrapper). Some comments:
     
 Last Millenium Reanalysis (Python): https://github.com/modons/LMR
-    - I tried to install it once, but some package dependencies are really hard because it relies on old numpy and panda packages. Other disadvantages are that the code is outdated, it is really nested and defines it own classes. Nowadays a lot of the things done by hand there can be hugely simplified using xArray. Furthermore the code is a difficult to understand, making changes is not straight forward. It is based on a serial kalman filter, which is slower than other ensemble kalman filters for typical PaleoDA dimensions (There is actually an optimized Kalman Filter hidden in the code, it resembles the ETKF)
+    - I tried to install it once, but some package dependencies are tedious to install because they relies on old numpy and panda packages. I would say that the code is a bit outdated, it is really nested and defines it own classes. Nowadays a lot of the things done by hand there can be hugely simplified using xArray (which didn't exist yet when LMR was developed). The code is a bit difficult to understand, making changes is not straight forward. It is based on a serial kalman filter, which is slower than other ensemble kalman filters for typical PaleoDA dimensions (There is actually an optimized Kalman Filter hidden in the code which resembles the ETKF)
 
 - Derivates of the the LMR-Code:
     - LMR Online https://github.com/frodre/LMROnline, based on the original LMR, adapted for "online" DA with a linear inverse model

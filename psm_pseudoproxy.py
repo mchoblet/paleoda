@@ -7,6 +7,8 @@ from scipy import integrate, signal
 
 from haversine import haversine_vector, Unit
 
+from pathos.multiprocessing import ProcessingPool as Pool
+
 def linear_psm(c, prior, pp_y_all):
     """
     Linear regression psm. The regression parameters are provided in pp_y_all.
@@ -87,7 +89,9 @@ def infilt_weighting(d18,pr,evap,slice_unfinished=True,check_nan=False):
             evap=kg_to_mm(evap)
         else:
             print('evaporation and precipitation units unknown, conversion not possible')
+    
 
+    
     #make evap values positive for later subtraction
     #evap=np.abs(evap)
 
@@ -126,23 +130,25 @@ def infilt_weighting(d18,pr,evap,slice_unfinished=True,check_nan=False):
     #SOME VALUES ARE SET TO ZERO DUE TO NO-AVAILABLE RECORDS
     # 0. TRY PRECIPITATION WEIGHTING
     
-    pr=prec_weighting(d18,pr,slice_unfinished=True)
+
+    pr=prec_weighting(d18,pr,slice_unfinished=True,check_nan=check_nan)
     inf_weighted=xr.where(inf_weighted==0,pr,inf_weighted)
     
     # 1. RECUR TO UNWEIGHTED D18=0 where inf_weighted is 0.
     
-    d18_unweighted=annual_mean(d18)
+    d18_unweighted=annual_mean(d18,check_nan=check_nan)
     inf_weighted=xr.where(inf_weighted==0,d18_unweighted,inf_weighted)
     
     #check nan option due to ihadcm3. the d18_unweighted will introduce nans
     if check_nan:
         print('Checking prior for nans')
-        for t in inf_weighted.time:
+        for i,t in enumerate(inf_weighted.time):
             x=inf_weighted.sel(time=t)
             nans=np.count_nonzero(np.isnan(x))
             if nans>0:
-                print('Dropped year', t.values, 'due to nans')
-                inf_weighted=inf_weighted.where(inf_weighted.time!=t, drop=True)
+                #print('Dropped year', t.values, 'due to nans')
+                #inf_weighted=inf_weighted.where(inf_weighted.time!=t, drop=True)
+                inf_weighted.loc[dict(time=t)]=inf_weighted.isel(time=(i-1))
     
     return inf_weighted
 
@@ -183,6 +189,19 @@ def pdb_coplen():
     #just return the pre-factor, because that's the one number needed
     return 1.03091 #*delta_pdb + 30.91
 
+def pdb_conversion(d18):
+    """
+    SMOW to PDB conversion
+    following Coplen 1983
+    """
+    return (d18-30.91)/1.03091
+
+def pdb_conversion_r(d18):
+    """
+    PDB to SMOW conversion
+    following Coplen 1983
+    """
+    return d18*1.03091+30.91
 
 ## Fractionation formulas
 #Normally given as 1000*ln(alpha)= ... , here formulated as alpha=...
@@ -215,13 +234,16 @@ def alpha_arag_thorrold(T):
 def alpha_arag_kim(T):
     return np.exp((17.88*10**3/T - 30.76)/1000)
 
-def frac(d18,T,pdb_conversion,exp_alpha):
+def frac(d18,T,exp_alpha):
     #calculates frac for numpy arrays/scalars
     
     #d18O: in permil
     #T: in Kelvin
     #pdb_conversion: formula
-    return ((d18+1000)/pdb_conversion())*(exp_alpha(T))-1000
+    
+    #UPDATE 03.11.22: PDB_CONVERSION IS PERFORMED IN THE BEGINNING
+    #return ((d18+1000)/pdb_conversion())*(exp_alpha(T))-1000
+    return ((d18+1000))*(exp_alpha(T))-1000
 
 def prec_weighting(d18,pr,slice_unfinished=False,check_nan=False):
     """
@@ -283,13 +305,13 @@ def prec_weighting(d18,pr,slice_unfinished=False,check_nan=False):
     #check nan option due to ihadcm3. there should be nans for sure.
     if check_nan:
         print('Checking prior for nans')
-        for t in pr_weighted.time:
+        for i,t in enumerate(pr_weighted.time):
             x=pr_weighted.sel(time=t)
             nans=np.count_nonzero(np.isnan(x))
             if nans>0:
-                print('Dropped year', t.values, 'due to nans')
-                pr_weighted=pr_weighted.where(pr_weighted.time!=t, drop=True)
-    
+                #print('Dropped year', t.values, 'due to nans')
+                #pr_weighted=pr_weighted.where(pr_weighted.time!=t, drop=True)
+                pr_weighted.loc[dict(time=t)]=pr_weighted.isel(time=(i-1))
     return pr_weighted
 
 #direct interpolation from
@@ -319,6 +341,8 @@ def obs_from_model(prior,lat,lon,interpol=None):
         dist=haversine_vector(loc,coords, Unit.KILOMETERS,comb=True)
         args=np.argsort(dist,axis=0)[:4].astype(int)
         dist2=np.take_along_axis(dist, args, axis=0)
+        #add a mininumber to avoid division by zero when using distance weighting
+        dist2=dist2+1E-10
         weight0=1/dist2
 
         weight=(weight0/(np.sum(weight0,axis=0)))
@@ -349,7 +373,7 @@ def pseudoproxies(prior_vals,SNR=5,noisetype='w',a=0.32,seed=None):
     Some tweaking to get the correc axis and do the matrix calculation with np.einsum.
     
     Input:
-        prior_vals: time series (locations,time)
+        prior_vals: time series (site,time)
         SNR: signal to noise variance ratio
         SNR= STD(True timeseries)/STD(Noise)
         
@@ -382,6 +406,10 @@ def pseudoproxies(prior_vals,SNR=5,noisetype='w',a=0.32,seed=None):
         #put back to dataarray
         pp_R=xr.DataArray(pp_R,dims=['time','site'])
         pp_R['time']=pp_Y.time
+        
+        #check the ratios
+        #print(prior_vals.std('time')/(prior_vals-pp_Y).std('time'))
+        
         
     #check that formula is correct
     #print('SNR',prior_std/(pp_Y-prior_vals).std(axis=-1))
@@ -584,7 +612,19 @@ def ice_archive(d18Oice, pr_ann, tas_ann, psl_ann, nproc=8):
     bmean = np.mean(bdown)
     depth = np.sum(bdown)
     depth_horizons = np.cumsum(bdown)
-    dz = np.min(depth_horizons)/10.  # step in depth [m]
+
+    #assure there is no zero in here! (MC)
+    #dz = np.min(depth_horizons[np.nonzero(depth_horizons)])/10.  # step in depth [m]
+    #what is this? the smalles value is simply the first one! and its arbitrary to take it as dz, can just take bmean
+    dz=bmean/10
+    #dz = np.min(depth_horizons)/10.  # step in depth [m]
+    
+    
+    
+    
+    #if depth_horizons[0]==0:
+    #    import pdb
+    #    pdb.set_trace()
     
     #print(dz)
     #print(depth)
@@ -600,7 +640,11 @@ def ice_archive(d18Oice, pr_ann, tas_ann, psl_ann, nproc=8):
     # ======================================================================
     # A.1: Compaction Model
     # ======================================================================
+    
+    
+    ## above I changed that this is unequal zero
     z = np.arange(0, depth, dz) + dz  # linear depth scale
+    
     #print('start',z[0])
     #print('end',z[-1])
     #print('dz',dz)
@@ -669,7 +713,12 @@ def ice_archive(d18Oice, pr_ann, tas_ann, psl_ann, nproc=8):
         zp = np.arange(-bound, bound, dz)
     """
     bound = 0.20*len(z)*dz
+    
+    #try: 
     zp = np.arange(-bound, bound, dz)
+    #except:
+    #    import pdb
+    #    pdb.set_trace()
     
     #  print('start for loop ...')
     #  start_time = time.time()
@@ -678,6 +727,8 @@ def ice_archive(d18Oice, pr_ann, tas_ann, psl_ann, nproc=8):
     cdel = iso_interp-rm
 
     diffused_final = np.zeros(len(iso_interp))
+    
+    """
     if nproc == 1:
         for i in range(len(sigma)):
             sig = sigma[i]
@@ -688,23 +739,27 @@ def ice_archive(d18Oice, pr_ann, tas_ann, psl_ann, nproc=8):
             diffused = signal.fftconvolve(cdel, G, mode='same')*dz  # put cdel in the front to keep the same length as before
             diffused += rm  # remove mean and then put back
             diffused_final[i] = diffused[i]
+    
+    """
+    #else:
+    
+    #  print('Multiprocessing: nproc = {}'.format(nproc))
 
-    else:
-        #  print('Multiprocessing: nproc = {}'.format(nproc))
 
-        def conv(sig, i):
-            part1 = 1./(sig*np.sqrt(2.*np.pi))
-            part2 = np.exp(-zp**2/(2*sig**2))
-            G = part1*part2
-            diffused = signal.fftconvolve(cdel, G, mode='same')*dz
-            diffused += rm  # remove mean and then put back
+    nproc=4
+    def conv(sig, i):
+        part1 = 1./(sig*np.sqrt(2.*np.pi))
+        part2 = np.exp(-zp**2/(2*sig**2))
+        G = part1*part2
+        diffused = signal.fftconvolve(cdel, G, mode='same')*dz
+        diffused += rm  # remove mean and then put back
 
-            return diffused[i]
-        
-        res=conv(sigma,range(len(sigma)))
-        #res = Pool(nproc).map(conv, sigma, range(len(sigma)))
-        diffused_final[:len(res)] = np.array(res)
-
+        return diffused[i]
+    
+    #res=conv(sigma,range(len(sigma)))
+    res = Pool(nproc).map(conv, sigma, range(len(sigma)))
+    diffused_final[:len(res)] = np.array(res)
+    
     #  print('for loop: {:0.2f} s'.format(time.time()-start_time))
 
     # take off the first few and last few points used in convolution
