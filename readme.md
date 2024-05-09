@@ -1,5 +1,7 @@
 # PaleoDA - Reconstructing past climates with Data Assimilation
-Code written in Python for my master thesis project.
+Code written in Python for my master thesis project (Finalized in December 2022)
+
+**For the most up to date version of the code (though with less functionalities) check https://github.com/mchoblet/paleoda_sa**
 
 
 With this code in  PaleoDA repository you can
